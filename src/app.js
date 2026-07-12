@@ -208,9 +208,13 @@ function parseEPS(text) {
   let ctm = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
   const gstack = [];
 
-  function isNum(t) { return /^-?\d*\.?\d+(e[-+]?\d+)?$/i.test(t); }
+  function isNum(t) { return /^-?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(t); }
   function tx(x, y) { return { x: ctm.a * x + ctm.c * y + ctm.e, y: ctm.b * x + ctm.d * y + ctm.f }; }
-  function popN(n) { const out = stack.splice(stack.length - n, n); return out.map(Number); }
+  function popN(n) {
+    const out = stack.splice(Math.max(0, stack.length - n), n);
+    while (out.length < n) out.unshift(0);
+    return out.map(function (v) { const num = Number(v); return isFinite(num) ? num : 0; });
+  }
   function rgbToHex(r, g, b) {
     function h(v) { v = Math.max(0, Math.min(1, v)); return Math.round(v * 255).toString(16).padStart(2, '0'); }
     return '#' + h(r) + h(g) + h(b);
@@ -1637,12 +1641,19 @@ function flipEpsShapes(shapes, bbox) {
 function importEPSText(text) {
   const result = parseEPS(text);
   if (!result.shapes.length) { toast('No vector paths could be extracted from that EPS file — it may rely on embedded fonts, images, or patterns this converter does not support.'); return; }
-  const shapes = flipEpsShapes(result.shapes, result.bbox);
+  const flipped = flipEpsShapes(result.shapes, result.bbox);
+  const shapes = flipped.filter(function (s) {
+    const b = shapeBBox(s);
+    return isFinite(b.x) && isFinite(b.y) && isFinite(b.w) && isFinite(b.h);
+  });
+  const skipped = flipped.length - shapes.length;
+  if (!shapes.length) { toast('That EPS file used PostScript features this converter could not interpret cleanly — no valid paths were recovered.'); return; }
   state.shapes.push.apply(state.shapes, shapes);
   state.selectedIds = shapes.map(function (s) { return s.id; });
   pushHistory();
   fitView(); render(); renderLayers(); renderProps();
-  toast('Converted ' + shapes.length + ' path(s) from EPS to editable SVG. Fonts, images, and patterns in the original are not carried over.');
+  const skipNote = skipped ? (' ' + skipped + ' path(s) could not be recovered and were skipped.') : '';
+  toast('Converted ' + shapes.length + ' path(s) from EPS to editable SVG. Fonts, images, and patterns in the original are not carried over.' + skipNote);
 }
 
 /* ---------- Export ---------- */
