@@ -182,7 +182,7 @@ function splitCubic(p0, c, t) {
    EPS is PostScript; we don't run a full interpreter. We tokenize the
    page-description body and track a small stack machine that understands
    the common path/paint operators (moveto/lineto/curveto/closepath,
-   fill/stroke, setrgbcolor/setgray/sethsbcolor, gsave/grestore for color
+   fill/stroke, setrgbcolor/setgray/sethsbcolor/setcmykcolor, gsave/grestore for color
    state, translate/scale for a simple current-transform). Fonts, images,
    patterns, clips and shadings are not supported and are skipped. */
 function parseEPS(text) {
@@ -288,6 +288,12 @@ function parseEPS(text) {
       }
       case 'setgray': {
         const [v] = popN(1); const hex = rgbToHex(v, v, v);
+        fillColor = hex; strokeColor = hex; break;
+      }
+      case 'setcmykcolor': {
+        const [c, m, y, k] = popN(4);
+        const r = (1 - c) * (1 - k), g = (1 - m) * (1 - k), b = (1 - y) * (1 - k);
+        const hex = rgbToHex(r, g, b);
         fillColor = hex; strokeColor = hex; break;
       }
       case 'sethsbcolor': {
