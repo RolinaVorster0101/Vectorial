@@ -343,7 +343,7 @@ function makeText(x, y, content) {
   return baseShape('text', { x: x, y: y, content: content || 'Text', fontSize: 24, fontFamily: 'Space Grotesk, sans-serif', fill: '#e8eaed', stroke: 'none', strokeWidth: 0 });
 }
 function makePath(commands) {
-  return baseShape('path', { commands: commands, fill: 'none' });
+  return baseShape('path', { commands: commands, fill: 'none', fillRule: 'nonzero' });
 }
 
 /* ---------- Path <-> d string ---------- */
@@ -443,12 +443,112 @@ function splitCubic(p0, c, t) {
 }
 
 /* ---------- Best-effort EPS -> shapes parser ----------
-   EPS is PostScript; we don't run a full interpreter. We tokenize the
-   page-description body and track a small stack machine that understands
-   the common path/paint operators (moveto/lineto/curveto/closepath,
-   fill/stroke, setrgbcolor/setgray/sethsbcolor/setcmykcolor, gsave/grestore for color
-   state, translate/scale for a simple current-transform). Fonts, images,
-   patterns, clips and shadings are not supported and are skipped. */
+   EPS is PostScript, and real-world EPS (especially from Cairo, Inkscape,
+   or PDF-to-EPS converters) almost never calls operators like "moveto" or
+   "fill" directly. Instead the file defines short procedure aliases at
+   the top ("/m { moveto } bind def", "/f { fill } bind def", etc.) and
+   the drawing content calls those aliases. So this is a two-pass, minimal
+   PostScript interpreter: pass 1 extracts "/name { ... } [bind] def"
+   procedure definitions into a dictionary; pass 2 executes the remaining
+   tokens, recursively expanding any call to a user-defined procedure name
+   (depth-limited against runaway/self-referential definitions).
+   Supported: path/paint ops (moveto/lineto/curveto/closepath, rmoveto/
+   rlineto/rcurveto, fill/eofill/stroke), color ops (setrgbcolor/setgray/
+   sethsbcolor/setcmykcolor), transform ops (translate/scale/concat/cm),
+   basic stack & arithmetic ops needed by common prologs (dup/pop/exch/
+   roll/index/copy/neg/add/sub/mul/div), minimal array support (array/
+   astore/concat) since "cm" is commonly implemented as
+   "6 array astore concat", a direct "re" (rectangle) as both a built-in
+   and via user-defined procedures, and gsave/grestore for color+CTM state.
+   Fonts, images, patterns, clipping, and shadings are not supported and
+   are skipped. */
+/* Tokenize a PostScript body respecting string literals: PS strings are
+   delimited by unescaped parens and may contain nested balanced parens
+   (and any other character, including brace characters) without needing
+   escapes. A naive scanner that counts "{"/"}" anywhere in the raw text
+   -- regardless of whether it's inside a string -- can massively
+   miscount procedure-body nesting depth on real-world files (e.g. text
+   content containing a literal brace), which can capture huge swaths of
+   the file as a single bogus "procedure" and cause catastrophic
+   slowdown when it's later executed. This scanner skips string and
+   array-literal content properly instead. */
+function tokenizeEPSBody(text) {
+  const tokens = [];
+  const n = text.length;
+  let i = 0;
+  while (i < n) {
+    const ch = text[i];
+    if (/\s/.test(ch)) { i++; continue; }
+    if (ch === '(') {
+      let depth = 1; i++;
+      while (i < n && depth > 0) {
+        if (text[i] === '\\') { i += 2; continue; }
+        if (text[i] === '(') depth++;
+        else if (text[i] === ')') depth--;
+        i++;
+      }
+      continue; // string content isn't needed for path geometry
+    }
+    if (ch === ')') { i++; continue; } // stray/unmatched paren: skip defensively
+    if (ch === '{' || ch === '}') { tokens.push(ch); i++; continue; }
+    if (ch === '[' || ch === ']') { i++; continue; } // array-literal brackets: not used by our operators
+    if (ch === '/') {
+      let j = i + 1;
+      while (j < n && !/[\s\/{}()\[\]]/.test(text[j])) j++;
+      tokens.push(text.slice(i, j));
+      i = j;
+      continue;
+    }
+    let j = i;
+    while (j < n && !/[\s\/{}()\[\]]/.test(text[j])) j++;
+    if (j === i) { i++; continue; }
+    tokens.push(text.slice(i, j));
+    i = j;
+  }
+  return tokens;
+}
+
+/* Real-world gradient fills in EPS are almost always done via the
+   PostScript "shfill" operator (fill the current clip region with a
+   shading), rather than a simple color operator. Fully interpreting a
+   shading dictionary + PostScript Function is out of scope, so instead
+   we pre-scan the raw text (in document order, once per "shfill" call)
+   for the /C0 and /C1 color-stop arrays belonging to that shading's
+   Function definition (handling both a plain FunctionType 2 and a
+   FunctionType 3 stitching function with several nested sub-functions)
+   and average them into one representative flat color. */
+function extractShadingColors(text) {
+  const colors = [];
+  const shfillPositions = [];
+  let from = 0;
+  while (true) {
+    const idx = text.indexOf('shfill', from);
+    if (idx === -1) break;
+    shfillPositions.push(idx);
+    from = idx + 6;
+  }
+  let prevEnd = 0;
+  for (const idx of shfillPositions) {
+    const chunk = text.slice(prevEnd, idx);
+    const cfIdx = chunk.indexOf('CairoFunction');
+    const searchChunk = cfIdx >= 0 ? chunk.slice(cfIdx) : chunk;
+    const stopRe = /\/C[01]\s*\[\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\]/g;
+    let stopMatch;
+    let r = 0, g = 0, b = 0, n = 0;
+    while ((stopMatch = stopRe.exec(searchChunk))) {
+      r += parseFloat(stopMatch[1]); g += parseFloat(stopMatch[2]); b += parseFloat(stopMatch[3]); n++;
+    }
+    if (n) {
+      function hx(v) { return Math.max(0, Math.min(255, Math.round(v / n * 255))).toString(16).padStart(2, '0'); }
+      colors.push('#' + hx(r) + hx(g) + hx(b));
+    } else {
+      colors.push(null);
+    }
+    prevEnd = idx + 6;
+  }
+  return colors;
+}
+
 function parseEPS(text) {
   let bbox = null;
   const bboxMatch = text.match(/%%BoundingBox:\s*(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)/);
@@ -459,20 +559,51 @@ function parseEPS(text) {
     };
   }
 
-  const body = text.split('\n').filter(function (line) { return !/^\s*%/.test(line); }).join('\n');
-  const tokens = body.match(/\{|\}|\/[^\s\/{}()\[\]]+|[^\s{}()\[\]]+/g) || [];
+  const bodyText = text.split('\n').filter(function (line) { return !/^\s*%/.test(line); }).join('\n');
+  const tokens = tokenizeEPSBody(bodyText);
+  const shadingColors = extractShadingColors(bodyText);
 
+  function isNum(t) { return /^-?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(t); }
+
+  /* Pass 1: extract "/name { ... } [bind] def" procedure definitions,
+     leaving a flat top-level token stream with the definitions removed. */
+  const procs = {};
+  const topTokens = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t[0] === '/' && tokens[i + 1] === '{') {
+      const name = t.slice(1);
+      let depth = 0, j = i + 1;
+      const bodyTokens = [];
+      for (; j < tokens.length; j++) {
+        if (tokens[j] === '{') { depth++; if (depth === 1) continue; }
+        if (tokens[j] === '}') { depth--; if (depth === 0) break; }
+        bodyTokens.push(tokens[j]);
+      }
+      let k = j + 1;
+      if (tokens[k] === 'bind') k++;
+      if (tokens[k] === 'def') k++;
+      procs[name] = bodyTokens;
+      i = k - 1;
+      continue;
+    }
+    topTokens.push(t);
+  }
+
+  /* Pass 2: execute, expanding proc calls recursively. */
   const shapes = [];
   const stack = [];
   let cur = { x: 0, y: 0 };
   let subStart = { x: 0, y: 0 };
   let cmds = [];
   let fillColor = '#000000';
+  let lastClipPath = null;
+  let lastClipRule = 'nonzero';
+  let shfillCounter = 0;
   let strokeColor = '#000000';
   let ctm = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
   const gstack = [];
 
-  function isNum(t) { return /^-?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(t); }
   function tx(x, y) { return { x: ctm.a * x + ctm.c * y + ctm.e, y: ctm.b * x + ctm.d * y + ctm.f }; }
   function popN(n) {
     const out = stack.splice(Math.max(0, stack.length - n), n);
@@ -485,58 +616,55 @@ function parseEPS(text) {
   }
   function hsbToHex(h, s, v) {
     let r, g, b;
-    const i = Math.floor(h * 6), f = h * 6 - i, p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+    const i = Math.floor(h * 6), f = h * 6 - i, p = v * (1 - s), q = v * (1 - f * s), tt = v * (1 - (1 - f) * s);
     switch (i % 6) {
-      case 0: r = v; g = t; b = p; break;
+      case 0: r = v; g = tt; b = p; break;
       case 1: r = q; g = v; b = p; break;
-      case 2: r = p; g = v; b = t; break;
+      case 2: r = p; g = v; b = tt; break;
       case 3: r = p; g = q; b = v; break;
-      case 4: r = t; g = p; b = v; break;
+      case 4: r = tt; g = p; b = v; break;
       default: r = v; g = p; b = q; break;
     }
     return rgbToHex(r, g, b);
   }
-  function finalizePath(mode) {
+  function finalizePath(mode, rule) {
     if (cmds.length === 0) return;
     const shape = makePath(cmds.slice());
     shape.fill = mode === 'stroke' ? 'none' : fillColor;
     shape.stroke = mode === 'fill' ? 'none' : strokeColor;
     shape.strokeWidth = mode === 'fill' ? 0 : 1.5;
+    shape.fillRule = rule || 'nonzero';
     shape.name = 'EPS Path';
     shapes.push(shape);
   }
+  function concatMatrix(a2, b2, c2, d2, e2, f2) {
+    const na = ctm.a * a2 + ctm.c * b2, nb = ctm.b * a2 + ctm.d * b2;
+    const nc = ctm.a * c2 + ctm.c * d2, nd = ctm.b * c2 + ctm.d * d2;
+    const ne = ctm.a * e2 + ctm.c * f2 + ctm.e, nf = ctm.b * e2 + ctm.d * f2 + ctm.f;
+    ctm = { a: na, b: nb, c: nc, d: nd, e: ne, f: nf };
+  }
 
-  for (let i = 0; i < tokens.length; i++) {
-    const t = tokens[i];
-    if (isNum(t)) { stack.push(parseFloat(t)); continue; }
-    if (t[0] === '/') { stack.push(t); continue; }
-    if (t === '{' || t === '}') continue;
+  let opBudget = 2000000; // hard cap so no input can hang the tab
+  let truncated = false;
+  function execOne(t, depth) {
+    if (depth > 40) return; // guard against runaway/self-referential proc definitions
+    if (opBudget-- <= 0) { truncated = true; return; }
+    if (isNum(t)) { if (stack.length < 5000) stack.push(parseFloat(t)); return; }
+    if (t[0] === '/') { stack.push(t); return; }
+    if (t === '{' || t === '}') return;
+    if (Object.prototype.hasOwnProperty.call(procs, t)) {
+      const body = procs[t];
+      for (const bt of body) execOne(bt, depth + 1);
+      return;
+    }
 
     switch (t) {
       case 'newpath': cmds = []; break;
-      case 'moveto': {
-        const [x, y] = popN(2); const p = tx(x, y);
-        cmds.push({ type: 'M', x: p.x, y: p.y }); cur = p; subStart = p; break;
-      }
-      case 'rmoveto': {
-        const [dx, dy] = popN(2);
-        const abs = { x: cur.x + dx * ctm.a + dy * ctm.c, y: cur.y + dx * ctm.b + dy * ctm.d };
-        cmds.push({ type: 'M', x: abs.x, y: abs.y }); cur = abs; subStart = abs; break;
-      }
-      case 'lineto': {
-        const [x, y] = popN(2); const p = tx(x, y);
-        cmds.push({ type: 'L', x: p.x, y: p.y }); cur = p; break;
-      }
-      case 'rlineto': {
-        const [dx, dy] = popN(2);
-        const abs = { x: cur.x + dx * ctm.a + dy * ctm.c, y: cur.y + dx * ctm.b + dy * ctm.d };
-        cmds.push({ type: 'L', x: abs.x, y: abs.y }); cur = abs; break;
-      }
-      case 'curveto': {
-        const [x1, y1, x2, y2, x3, y3] = popN(6);
-        const p1 = tx(x1, y1), p2 = tx(x2, y2), p3 = tx(x3, y3);
-        cmds.push({ type: 'C', x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y, x: p3.x, y: p3.y }); cur = p3; break;
-      }
+      case 'moveto': { const [x, y] = popN(2); const p = tx(x, y); cmds.push({ type: 'M', x: p.x, y: p.y }); cur = p; subStart = p; break; }
+      case 'rmoveto': { const [dx, dy] = popN(2); const abs = { x: cur.x + dx * ctm.a + dy * ctm.c, y: cur.y + dx * ctm.b + dy * ctm.d }; cmds.push({ type: 'M', x: abs.x, y: abs.y }); cur = abs; subStart = abs; break; }
+      case 'lineto': { const [x, y] = popN(2); const p = tx(x, y); cmds.push({ type: 'L', x: p.x, y: p.y }); cur = p; break; }
+      case 'rlineto': { const [dx, dy] = popN(2); const abs = { x: cur.x + dx * ctm.a + dy * ctm.c, y: cur.y + dx * ctm.b + dy * ctm.d }; cmds.push({ type: 'L', x: abs.x, y: abs.y }); cur = abs; break; }
+      case 'curveto': { const [x1, y1, x2, y2, x3, y3] = popN(6); const p1 = tx(x1, y1), p2 = tx(x2, y2), p3 = tx(x3, y3); cmds.push({ type: 'C', x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y, x: p3.x, y: p3.y }); cur = p3; break; }
       case 'rcurveto': {
         const [x1, y1, x2, y2, x3, y3] = popN(6);
         function rel(dx, dy) { return { x: cur.x + dx * ctm.a + dy * ctm.c, y: cur.y + dx * ctm.b + dy * ctm.d }; }
@@ -544,35 +672,63 @@ function parseEPS(text) {
         cmds.push({ type: 'C', x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y, x: p3.x, y: p3.y }); cur = p3; break;
       }
       case 'closepath': cmds.push({ type: 'Z' }); cur = subStart; break;
-      case 'fill': case 'eofill': finalizePath('fill'); break;
-      case 'stroke': finalizePath('stroke'); break;
-      case 'setrgbcolor': {
-        const [r, g, b] = popN(3); const hex = rgbToHex(r, g, b);
-        fillColor = hex; strokeColor = hex; break;
-      }
-      case 'setgray': {
-        const [v] = popN(1); const hex = rgbToHex(v, v, v);
-        fillColor = hex; strokeColor = hex; break;
-      }
-      case 'setcmykcolor': {
-        const [c, m, y, k] = popN(4);
-        const r = (1 - c) * (1 - k), g = (1 - m) * (1 - k), b = (1 - y) * (1 - k);
-        const hex = rgbToHex(r, g, b);
-        fillColor = hex; strokeColor = hex; break;
-      }
-      case 'sethsbcolor': {
-        const [h, s, v] = popN(3); const hex = hsbToHex(h, s, v);
-        fillColor = hex; strokeColor = hex; break;
-      }
-      case 'translate': {
-        const [dx, dy] = popN(2);
-        ctm = { a: ctm.a, b: ctm.b, c: ctm.c, d: ctm.d, e: ctm.e + dx * ctm.a + dy * ctm.c, f: ctm.f + dx * ctm.b + dy * ctm.d };
+      case 'clip': case 'W': if (cmds.length) { lastClipPath = cmds.slice(); lastClipRule = 'nonzero'; } break;
+      case 'eoclip': case 'W*': if (cmds.length) { lastClipPath = cmds.slice(); lastClipRule = 'evenodd'; } break;
+      case 'shfill': {
+        if (lastClipPath && lastClipPath.length) {
+          const shape = makePath(lastClipPath.slice());
+          shape.fill = shadingColors[shfillCounter] || fillColor;
+          shape.stroke = 'none';
+          shape.strokeWidth = 0;
+          shape.fillRule = lastClipRule || 'nonzero';
+          shape.name = 'EPS Gradient (approx)';
+          shapes.push(shape);
+        }
+        shfillCounter++;
         break;
       }
-      case 'scale': {
-        const [sx, sy] = popN(2);
-        ctm = { a: ctm.a * sx, b: ctm.b * sx, c: ctm.c * sy, d: ctm.d * sy, e: ctm.e, f: ctm.f };
+      case 'fill': finalizePath('fill', 'nonzero'); cmds = []; break;
+      case 'eofill': finalizePath('fill', 'evenodd'); cmds = []; break;
+      case 'stroke': finalizePath('stroke'); cmds = []; break;
+      case 'setrgbcolor': { const [r, g, b] = popN(3); const hex = rgbToHex(r, g, b); fillColor = hex; strokeColor = hex; break; }
+      case 'setgray': { const [v] = popN(1); const hex = rgbToHex(v, v, v); fillColor = hex; strokeColor = hex; break; }
+      case 'setcmykcolor': { const [c, m, y, k] = popN(4); const r = (1 - c) * (1 - k), g = (1 - m) * (1 - k), b = (1 - y) * (1 - k); fillColor = rgbToHex(r, g, b); strokeColor = fillColor; break; }
+      case 'sethsbcolor': { const [h, s, v] = popN(3); const hex = hsbToHex(h, s, v); fillColor = hex; strokeColor = hex; break; }
+      case 'translate': { const [dx, dy] = popN(2); ctm = { a: ctm.a, b: ctm.b, c: ctm.c, d: ctm.d, e: ctm.e + dx * ctm.a + dy * ctm.c, f: ctm.f + dx * ctm.b + dy * ctm.d }; break; }
+      case 'scale': { const [sx, sy] = popN(2); ctm = { a: ctm.a * sx, b: ctm.b * sx, c: ctm.c * sy, d: ctm.d * sy, e: ctm.e, f: ctm.f }; break; }
+      case 'concat': { const arr = stack.pop(); if (arr && arr.__psArray && arr.vals.length === 6) { const v = arr.vals; concatMatrix(v[0], v[1], v[2], v[3], v[4], v[5]); } break; }
+      case 'cm': { const [a2, b2, c2, d2, e2, f2] = popN(6); concatMatrix(a2, b2, c2, d2, e2, f2); break; }
+      case 'array': { const n = popN(1)[0]; stack.push({ __psArray: true, vals: new Array(Math.max(0, n)).fill(0) }); break; }
+      case 'astore': {
+        const arrObj = stack.pop();
+        if (arrObj && arrObj.__psArray) { arrObj.vals = popN(arrObj.vals.length); }
+        stack.push(arrObj);
         break;
+      }
+      case 'dup': { const v = stack[stack.length - 1]; stack.push(v); break; }
+      case 'pop': stack.pop(); break;
+      case 'exch': { const b = stack.pop(), a = stack.pop(); stack.push(b); stack.push(a); break; }
+      case 'neg': { const v = Number(stack.pop()); stack.push(-v); break; }
+      case 'add': { const b = Number(stack.pop()), a = Number(stack.pop()); stack.push(a + b); break; }
+      case 'sub': { const b = Number(stack.pop()), a = Number(stack.pop()); stack.push(a - b); break; }
+      case 'mul': { const b = Number(stack.pop()), a = Number(stack.pop()); stack.push(a * b); break; }
+      case 'div': { const b = Number(stack.pop()), a = Number(stack.pop()); stack.push(b !== 0 ? a / b : 0); break; }
+      case 'index': { const n = Math.max(0, Math.min(200, Number(stack.pop()) || 0)); stack.push(stack[stack.length - 1 - n]); break; }
+      case 'copy': { const n = Math.max(0, Math.min(200, Number(stack.pop()) || 0)); const sub = stack.slice(stack.length - n); stack.push.apply(stack, sub); break; }
+      case 'roll': {
+        const j = Number(stack.pop()), n = Number(stack.pop());
+        if (n > 0 && n <= stack.length) {
+          const elements = stack.splice(stack.length - n, n);
+          const rolled = elements.map(function (_, i) { const src = (((i - j) % n) + n) % n; return elements[src]; });
+          stack.push.apply(stack, rolled);
+        }
+        break;
+      }
+      case 're': {
+        const [x, y, w, h] = popN(4);
+        const p1 = tx(x, y), p2 = tx(x + w, y), p3 = tx(x + w, y + h), p4 = tx(x, y + h);
+        cmds.push({ type: 'M', x: p1.x, y: p1.y }, { type: 'L', x: p2.x, y: p2.y }, { type: 'L', x: p3.x, y: p3.y }, { type: 'L', x: p4.x, y: p4.y }, { type: 'Z' });
+        cur = p1; subStart = p1; break;
       }
       case 'gsave': gstack.push({ ctm: Object.assign({}, ctm), fillColor, strokeColor }); break;
       case 'grestore': {
@@ -580,11 +736,12 @@ function parseEPS(text) {
         if (g) { ctm = g.ctm; fillColor = g.fillColor; strokeColor = g.strokeColor; }
         break;
       }
-      default: stack.length = 0; break;
+      default: break; // unrecognized operator (fonts/images/clip/etc.): ignore and continue
     }
   }
 
-  return { shapes, bbox };
+  for (const t of topTokens) { if (truncated) break; execOne(t, 0); }
+  return { shapes, bbox, truncated };
 }
 
 /* ---------- Bounding box ---------- */
@@ -766,12 +923,13 @@ function resolvedStyle(el, rules, inherited) {
     if (attr) return attr;
     return undefined;
   }
-  const fillRaw = pick('fill'), strokeRaw = pick('stroke'), swRaw = pick('stroke-width'), opRaw = pick('opacity');
+  const fillRaw = pick('fill'), strokeRaw = pick('stroke'), swRaw = pick('stroke-width'), opRaw = pick('opacity'), frRaw = pick('fill-rule');
   return {
     fill: fillRaw !== undefined ? fillRaw : inherited.fill,
     stroke: strokeRaw !== undefined ? strokeRaw : inherited.stroke,
     strokeWidth: swRaw !== undefined ? parseFloat(swRaw) : inherited.strokeWidth,
     opacity: opRaw !== undefined ? parseFloat(opRaw) : inherited.opacity,
+    fillRule: frRaw !== undefined ? frRaw : (inherited.fillRule || 'nonzero'),
   };
 }
 function colorToRgb(c) {
@@ -872,7 +1030,7 @@ function importSVGDocument(doc) {
     if (/^url\(/.test(style.fill || '') || /^url\(/.test(style.stroke || '')) gradientUsedCount++;
     const sw = isFinite(style.strokeWidth) ? style.strokeWidth : 2;
     const op = isFinite(style.opacity) ? style.opacity : 1;
-    function apply(shape) { shape.fill = fill === 'none' ? 'none' : fill; shape.stroke = stroke; shape.strokeWidth = sw; shape.opacity = op; return shape; }
+    function apply(shape) { shape.fill = fill === 'none' ? 'none' : fill; shape.stroke = stroke; shape.strokeWidth = sw; shape.opacity = op; if (shape.type === 'path') shape.fillRule = style.fillRule === 'evenodd' ? 'evenodd' : 'nonzero'; return shape; }
 
     if (tag === 'rect') {
       const x = parseFloat(el.getAttribute('x') || 0), y = parseFloat(el.getAttribute('y') || 0);
@@ -920,7 +1078,7 @@ function importSVGDocument(doc) {
     }
   }
 
-  walk(root, matIdentity(), { fill: undefined, stroke: undefined, strokeWidth: undefined, opacity: undefined }, new Set());
+  walk(root, matIdentity(), { fill: undefined, stroke: undefined, strokeWidth: undefined, opacity: undefined, fillRule: 'nonzero' }, new Set());
   return { shapes: out, gradientApproximated: gradientUsedCount > 0 };
 }
 
@@ -1113,6 +1271,7 @@ function shapeToDOM(s) {
   } else if (s.type === 'path') {
     el = document.createElementNS(SVG_NS, 'path');
     el.setAttribute('d', commandsToD(s.commands));
+    if (s.fillRule === 'evenodd') el.setAttribute('fill-rule', 'evenodd');
   }
   el.setAttribute('data-id', s.id);
   el.setAttribute('fill', s.fill == null ? 'none' : s.fill);
@@ -1860,19 +2019,53 @@ function wireImport() {
     const file = El.fileInput.files[0];
     if (!file) return;
     const ext = file.name.split('.').pop().toLowerCase();
-    const reader = new FileReader();
-    reader.onload = function () {
-      try {
-        if (ext === 'svg') importSVGText(reader.result);
-        else if (ext === 'eps' || ext === 'ps' || ext === 'ai') importEPSText(reader.result);
-        else toast('Unsupported file type — please choose an .svg or .eps file.');
-      } catch (err) {
-        toast('Could not read that file: ' + err.message);
-      }
-      El.fileInput.value = '';
-    };
-    reader.readAsText(file);
+    if (ext === 'svg') {
+      const reader = new FileReader();
+      reader.onload = function () {
+        try { importSVGText(reader.result); }
+        catch (err) { toast('Could not read that file: ' + err.message); }
+        El.fileInput.value = '';
+      };
+      reader.readAsText(file);
+      return;
+    }
+    if (ext === 'eps' || ext === 'ps' || ext === 'ai') {
+      const reader = new FileReader();
+      reader.onload = function () {
+        try {
+          const text = decodeEPSArrayBuffer(reader.result);
+          importEPSText(text);
+        } catch (err) {
+          toast('Could not read that file: ' + err.message);
+        }
+        El.fileInput.value = '';
+      };
+      reader.readAsArrayBuffer(file);
+      return;
+    }
+    toast('Unsupported file type — please choose an .svg or .eps file.');
+    El.fileInput.value = '';
   });
+}
+/* Decode an EPS/PS/AI file from raw bytes to text. Handles the "DOS EPS
+   Binary File" wrapper (magic bytes C5 D0 D3 C6) used by many Windows/
+   Illustrator EPS exports that bundle a TIFF or WMF preview image inside
+   the same file alongside the real PostScript text: a 30-byte header
+   gives the byte offset and length of the actual PostScript section, and
+   without unwrapping it, the previewimage bytes get decoded as if they
+   were PostScript text (which is both wrong and can be very slow to
+   tokenize). Falls back to decoding the whole buffer as plain text for
+   ordinary (non-wrapped) EPS/PS files. */
+function decodeEPSArrayBuffer(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const isDosEpsBinary = bytes.length > 30 && bytes[0] === 0xC5 && bytes[1] === 0xD0 && bytes[2] === 0xD3 && bytes[3] === 0xC6;
+  const decoder = new TextDecoder('latin1'); // EPS is 7/8-bit text; latin1 preserves byte values 1:1
+  if (!isDosEpsBinary) return decoder.decode(bytes);
+  const dv = new DataView(buffer);
+  const psStart = dv.getUint32(4, true);
+  const psLength = dv.getUint32(8, true);
+  if (psStart + psLength > bytes.length || psLength <= 0) return decoder.decode(bytes);
+  return decoder.decode(bytes.subarray(psStart, psStart + psLength));
 }
 function importSVGText(text) {
   const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
@@ -1910,7 +2103,17 @@ function flipEpsShapes(shapes, bbox) {
 }
 function importEPSText(text) {
   const result = parseEPS(text);
-  if (!result.shapes.length) { toast('No vector paths could be extracted from that EPS file — it may rely on embedded fonts, images, or patterns this converter does not support.'); return; }
+  if (!result.shapes.length) {
+    const usesAGM = /Adobe_AGM_|Adobe_CoolType_/.test(text);
+    if (usesAGM) {
+      toast("This EPS was exported by Illustrator in \"full compatibility\" mode, which draws almost everything through Adobe's proprietary AGM/CoolType libraries rather than standard PostScript in the file itself — this converter can't reach that. Try re-exporting as SVG directly from Illustrator (or opening it in Inkscape and exporting SVG from there), then importing that instead.");
+    } else if (result.truncated) {
+      toast('That EPS file is unusually complex and parsing was stopped early to avoid hanging the page. No paths were recovered before the cutoff.');
+    } else {
+      toast('No vector paths could be extracted from that EPS file — it may rely on embedded fonts, images, or patterns this converter does not support.');
+    }
+    return;
+  }
   const flipped = flipEpsShapes(result.shapes, result.bbox);
   const shapes = flipped.filter(function (s) {
     const b = shapeBBox(s);
@@ -1923,7 +2126,8 @@ function importEPSText(text) {
   pushHistory();
   fitView(); render(); renderLayers(); renderProps();
   const skipNote = skipped ? (' ' + skipped + ' path(s) could not be recovered and were skipped.') : '';
-  toast('Converted ' + shapes.length + ' path(s) from EPS to editable SVG. Fonts, images, and patterns in the original are not carried over.' + skipNote);
+  const truncNote = result.truncated ? ' Parsing was stopped early because this file is unusually complex — some content may be missing.' : '';
+  toast('Converted ' + shapes.length + ' path(s) from EPS to editable SVG. Fonts, images, and patterns in the original are not carried over.' + skipNote + truncNote);
 }
 
 /* ---------- Export ---------- */
@@ -1935,7 +2139,7 @@ function shapeToSVGString(s) {
   if (s.type === 'ellipse') return '<ellipse cx="' + s.cx + '" cy="' + s.cy + '" rx="' + s.rx + '" ry="' + s.ry + '" ' + common + '/>';
   if (s.type === 'line') return '<line x1="' + s.x1 + '" y1="' + s.y1 + '" x2="' + s.x2 + '" y2="' + s.y2 + '" ' + common + '/>';
   if (s.type === 'text') return '<text x="' + s.x + '" y="' + s.y + '" font-size="' + s.fontSize + '" font-family="' + s.fontFamily + '" ' + common + '>' + escapeHtml(s.content) + '</text>';
-  if (s.type === 'path') return '<path d="' + commandsToD(s.commands) + '" ' + common + '/>';
+  if (s.type === 'path') return '<path d="' + commandsToD(s.commands) + '"' + (s.fillRule === 'evenodd' ? ' fill-rule="evenodd"' : '') + ' ' + common + '/>';
   return '';
 }
 function exportSVG() {
