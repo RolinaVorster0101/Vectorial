@@ -234,6 +234,7 @@ svg#canvasSvg text{ user-select:none; }
               </pattern>
             </defs>
             <rect id="gridRect" fill="url(#dotgrid)"></rect>
+            <defs id="gradientDefs"></defs>
             <g id="shapesLayer"></g>
             <g id="overlayLayer"></g>
           </svg>
@@ -517,8 +518,8 @@ function tokenizeEPSBody(text) {
    Function definition (handling both a plain FunctionType 2 and a
    FunctionType 3 stitching function with several nested sub-functions)
    and average them into one representative flat color. */
-function extractShadingColors(text) {
-  const colors = [];
+function extractShadingGradients(text) {
+  const gradients = [];
   const shfillPositions = [];
   let from = 0;
   while (true) {
@@ -532,21 +533,47 @@ function extractShadingColors(text) {
     const chunk = text.slice(prevEnd, idx);
     const cfIdx = chunk.indexOf('CairoFunction');
     const searchChunk = cfIdx >= 0 ? chunk.slice(cfIdx) : chunk;
-    const stopRe = /\/C[01]\s*\[\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\]/g;
-    let stopMatch;
-    let r = 0, g = 0, b = 0, n = 0;
-    while ((stopMatch = stopRe.exec(searchChunk))) {
-      r += parseFloat(stopMatch[1]); g += parseFloat(stopMatch[2]); b += parseFloat(stopMatch[3]); n++;
-    }
-    if (n) {
-      function hx(v) { return Math.max(0, Math.min(255, Math.round(v / n * 255))).toString(16).padStart(2, '0'); }
-      colors.push('#' + hx(r) + hx(g) + hx(b));
+
+    const shadingTypeMatch = searchChunk.match(/\/ShadingType\s+(\d)/);
+    const shadingType = shadingTypeMatch ? parseInt(shadingTypeMatch[1], 10) : 2;
+    const coordsMatch = searchChunk.match(/\/Coords\s*\[\s*([^\]]+)\]/);
+    const coordsRaw = coordsMatch ? coordsMatch[1].trim().split(/\s+/).map(Number) : null;
+
+    const funcTypeMatch = searchChunk.match(/\/FunctionType\s+(\d)/);
+    const domainMatch = searchChunk.match(/\/Domain\s*\[\s*([^\]]+)\]/);
+    const domain = domainMatch ? domainMatch[1].trim().split(/\s+/).map(Number) : [0, 1];
+
+    let stops = [];
+    if (funcTypeMatch && funcTypeMatch[1] === '3') {
+      const boundsMatch = searchChunk.match(/\/Bounds\s*\[\s*([^\]]*)\]/);
+      const bounds = boundsMatch && boundsMatch[1].trim() ? boundsMatch[1].trim().split(/\s+/).map(Number) : [];
+      const subC0C1 = [];
+      const subFuncRe = /\/C0\s*\[\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\][\s\S]*?\/C1\s*\[\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\]/g;
+      let sm;
+      while ((sm = subFuncRe.exec(searchChunk))) {
+        subC0C1.push({
+          c0: [parseFloat(sm[1]), parseFloat(sm[2]), parseFloat(sm[3])],
+          c1: [parseFloat(sm[4]), parseFloat(sm[5]), parseFloat(sm[6])],
+        });
+      }
+      const offsets = [domain[0]].concat(bounds).concat([domain[1]]);
+      for (let i = 0; i < subC0C1.length && i < offsets.length - 1; i++) {
+        stops.push({ offset: offsets[i], color: subC0C1[i].c0 });
+        stops.push({ offset: offsets[i + 1], color: subC0C1[i].c1 });
+      }
     } else {
-      colors.push(null);
+      const c0Match = searchChunk.match(/\/C0\s*\[\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\]/);
+      const c1Match = searchChunk.match(/\/C1\s*\[\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s*\]/);
+      if (c0Match && c1Match) {
+        stops.push({ offset: domain[0], color: [parseFloat(c0Match[1]), parseFloat(c0Match[2]), parseFloat(c0Match[3])] });
+        stops.push({ offset: domain[1], color: [parseFloat(c1Match[1]), parseFloat(c1Match[2]), parseFloat(c1Match[3])] });
+      }
     }
+
+    gradients.push(stops.length ? { type: shadingType === 3 ? 'radial' : 'linear', stops: stops, coordsRaw: coordsRaw, domain: domain } : null);
     prevEnd = idx + 6;
   }
-  return colors;
+  return gradients;
 }
 
 function parseEPS(text) {
@@ -561,7 +588,7 @@ function parseEPS(text) {
 
   const bodyText = text.split('\n').filter(function (line) { return !/^\s*%/.test(line); }).join('\n');
   const tokens = tokenizeEPSBody(bodyText);
-  const shadingColors = extractShadingColors(bodyText);
+  const shadingGradients = extractShadingGradients(bodyText);
 
   function isNum(t) { return /^-?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(t); }
 
@@ -677,11 +704,28 @@ function parseEPS(text) {
       case 'shfill': {
         if (lastClipPath && lastClipPath.length) {
           const shape = makePath(lastClipPath.slice());
-          shape.fill = shadingColors[shfillCounter] || fillColor;
+          const grad = shadingGradients[shfillCounter];
           shape.stroke = 'none';
           shape.strokeWidth = 0;
           shape.fillRule = lastClipRule || 'nonzero';
-          shape.name = 'EPS Gradient (approx)';
+          shape.name = 'EPS Gradient';
+          if (grad && grad.stops.length >= 2 && grad.coordsRaw) {
+            const c = grad.coordsRaw;
+            const domainSpan = (grad.domain[1] - grad.domain[0]) || 1;
+            const stops = grad.stops.map(function (st) {
+              return { offset: (st.offset - grad.domain[0]) / domainSpan, color: rgbToHex(st.color[0], st.color[1], st.color[2]) };
+            });
+            if (grad.type === 'radial' && c.length === 6) {
+              const focal = tx(c[0], c[1]), outer = tx(c[3], c[4]);
+              const scaleApprox = (Math.hypot(ctm.a, ctm.b) + Math.hypot(ctm.c, ctm.d)) / 2;
+              shape.gradient = { type: 'radial', stops: stops, coords: { fx: focal.x, fy: focal.y, cx: outer.x, cy: outer.y, r: Math.abs(c[5]) * scaleApprox } };
+            } else if (c.length >= 4) {
+              const p0 = tx(c[0], c[1]), p1 = tx(c[2], c[3]);
+              shape.gradient = { type: 'linear', stops: stops, coords: { x1: p0.x, y1: p0.y, x2: p1.x, y2: p1.y } };
+            }
+            shape.fill = stops[0].color; // fallback representative color if gradient ever can't render
+          }
+          if (!shape.gradient) shape.fill = fillColor; // couldn't extract gradient data: fall back to last flat color
           shapes.push(shape);
         }
         shfillCounter++;
@@ -696,7 +740,17 @@ function parseEPS(text) {
       case 'sethsbcolor': { const [h, s, v] = popN(3); const hex = hsbToHex(h, s, v); fillColor = hex; strokeColor = hex; break; }
       case 'translate': { const [dx, dy] = popN(2); ctm = { a: ctm.a, b: ctm.b, c: ctm.c, d: ctm.d, e: ctm.e + dx * ctm.a + dy * ctm.c, f: ctm.f + dx * ctm.b + dy * ctm.d }; break; }
       case 'scale': { const [sx, sy] = popN(2); ctm = { a: ctm.a * sx, b: ctm.b * sx, c: ctm.c * sy, d: ctm.d * sy, e: ctm.e, f: ctm.f }; break; }
-      case 'concat': { const arr = stack.pop(); if (arr && arr.__psArray && arr.vals.length === 6) { const v = arr.vals; concatMatrix(v[0], v[1], v[2], v[3], v[4], v[5]); } break; }
+      case 'concat': {
+        const top = stack[stack.length - 1];
+        if (top && top.__psArray && top.vals.length === 6) {
+          const v = stack.pop().vals;
+          concatMatrix(v[0], v[1], v[2], v[3], v[4], v[5]);
+        } else {
+          const v = popN(6);
+          concatMatrix(v[0], v[1], v[2], v[3], v[4], v[5]);
+        }
+        break;
+      }
       case 'cm': { const [a2, b2, c2, d2, e2, f2] = popN(6); concatMatrix(a2, b2, c2, d2, e2, f2); break; }
       case 'array': { const n = popN(1)[0]; stack.push({ __psArray: true, vals: new Array(Math.max(0, n)).fill(0) }); break; }
       case 'astore': {
@@ -1096,6 +1150,7 @@ function init() {
   El.shapesLayer = $('shapesLayer');
   El.overlayLayer = $('overlayLayer');
   El.gridRect = $('gridRect');
+  El.gradientDefs = $('gradientDefs');
   El.rulerTop = $('rulerTop');
   El.rulerLeft = $('rulerLeft');
   El.layersList = $('layersList');
@@ -1259,7 +1314,7 @@ function shapeToDOM(s) {
     txt.setAttribute('x', s.x); txt.setAttribute('y', s.y);
     txt.setAttribute('font-size', s.fontSize);
     txt.setAttribute('font-family', s.fontFamily || 'Space Grotesk, sans-serif');
-    txt.setAttribute('fill', s.fill == null ? 'none' : s.fill);
+    txt.setAttribute('fill', s.gradient ? 'url(#' + gradientIdFor(s.id) + ')' : (s.fill == null ? 'none' : s.fill));
     txt.setAttribute('stroke', s.stroke == null ? 'none' : s.stroke);
     txt.setAttribute('stroke-width', s.strokeWidth || 0);
     txt.setAttribute('opacity', s.opacity == null ? 1 : s.opacity);
@@ -1274,7 +1329,7 @@ function shapeToDOM(s) {
     if (s.fillRule === 'evenodd') el.setAttribute('fill-rule', 'evenodd');
   }
   el.setAttribute('data-id', s.id);
-  el.setAttribute('fill', s.fill == null ? 'none' : s.fill);
+  el.setAttribute('fill', s.gradient ? 'url(#' + gradientIdFor(s.id) + ')' : (s.fill == null ? 'none' : s.fill));
   el.setAttribute('stroke', s.stroke == null ? 'none' : s.stroke);
   el.setAttribute('stroke-width', s.strokeWidth || 0);
   el.setAttribute('opacity', s.opacity == null ? 1 : s.opacity);
@@ -1283,8 +1338,40 @@ function shapeToDOM(s) {
   return el;
 }
 
+function gradientIdFor(shapeId) { return 'grad_' + shapeId; }
+function buildGradientDefs(container, shapes) {
+  container.innerHTML = '';
+  for (const s of shapes) {
+    if (!s.gradient || !s.gradient.stops || !s.gradient.stops.length) continue;
+    const g = s.gradient;
+    let el;
+    if (g.type === 'radial') {
+      el = document.createElementNS(SVG_NS, 'radialGradient');
+      el.setAttribute('gradientUnits', 'userSpaceOnUse');
+      el.setAttribute('cx', g.coords.cx); el.setAttribute('cy', g.coords.cy); el.setAttribute('r', Math.max(0.01, g.coords.r));
+      if (g.coords.fx != null) el.setAttribute('fx', g.coords.fx);
+      if (g.coords.fy != null) el.setAttribute('fy', g.coords.fy);
+    } else {
+      el = document.createElementNS(SVG_NS, 'linearGradient');
+      el.setAttribute('gradientUnits', 'userSpaceOnUse');
+      el.setAttribute('x1', g.coords.x1); el.setAttribute('y1', g.coords.y1);
+      el.setAttribute('x2', g.coords.x2); el.setAttribute('y2', g.coords.y2);
+    }
+    el.setAttribute('id', gradientIdFor(s.id));
+    g.stops.forEach(function (stop) {
+      const stopEl = document.createElementNS(SVG_NS, 'stop');
+      stopEl.setAttribute('offset', Math.max(0, Math.min(1, stop.offset)));
+      stopEl.setAttribute('stop-color', stop.color);
+      if (stop.opacity != null && stop.opacity < 1) stopEl.setAttribute('stop-opacity', stop.opacity);
+      el.appendChild(stopEl);
+    });
+    container.appendChild(el);
+  }
+}
+
 function render() {
   El.shapesLayer.innerHTML = '';
+  buildGradientDefs(El.gradientDefs, state.shapes);
   for (const s of state.shapes) {
     if (s.visible === false) continue;
     El.shapesLayer.appendChild(shapeToDOM(s));
@@ -1964,7 +2051,7 @@ function renderProps() {
           return '<option value="' + f + '"' + (s.fontFamily === f ? ' selected' : '') + '>' + f.split(',')[0] + '</option>';
         }).join('') + '</select></label>';
     } else if (s.type === 'path') {
-      html += '<div class="hint-text">' + s.commands.length + ' path commands · press A to edit nodes</div>';
+      html += '<div class="hint-text">' + s.commands.length + ' path commands · press A to edit nodes' + (s.gradient ? ' · gradient fill (editing Fill below replaces it with a flat color)' : '') + '</div>';
     }
   }
   html += '<div class="props-section-title">' + (sel.length > 1 ? sel.length + ' OBJECTS · STYLE' : 'STYLE') + '</div>';
@@ -1979,7 +2066,7 @@ function renderProps() {
     const commit = function () {
       let val = input.type === 'range' || input.type === 'number' ? parseFloat(input.value) : (input.tagName === 'TEXTAREA' ? input.value : input.value);
       sel.forEach(function (shape) {
-        if (key === 'fill' || key === 'stroke') { shape[key] = val; }
+        if (key === 'fill' || key === 'stroke') { shape[key] = val; if (key === 'fill') shape.gradient = null; }
         else if (['x', 'y', 'w', 'h', 'rx', 'ry', 'cx', 'cy', 'x1', 'y1', 'x2', 'y2', 'strokeWidth', 'opacity', 'fontSize'].includes(key)) { shape[key] = isNaN(val) ? 0 : val; }
         else { shape[key] = val; }
       });
@@ -1992,7 +2079,7 @@ function renderProps() {
     cb.addEventListener('change', function () {
       const key = cb.getAttribute('data-nonefor');
       const colorInput = El.propsBody.querySelector('[data-key="' + key + '"][type="color"]');
-      sel.forEach(function (shape) { shape[key] = cb.checked ? 'none' : colorInput.value; });
+      sel.forEach(function (shape) { shape[key] = cb.checked ? 'none' : colorInput.value; if (key === 'fill') shape.gradient = null; });
       colorInput.disabled = cb.checked;
       render(); renderLayers(); pushHistory();
     });
@@ -2098,6 +2185,16 @@ function flipEpsShapes(shapes, bbox) {
       c.x -= bbox.x0; c.y = h - (c.y - bbox.y0);
       if (c.type === 'C') { c.x1 -= bbox.x0; c.y1 = h - (c.y1 - bbox.y0); c.x2 -= bbox.x0; c.y2 = h - (c.y2 - bbox.y0); }
     });
+    if (s.gradient) {
+      const c = s.gradient.coords;
+      if (s.gradient.type === 'radial') {
+        c.cx -= bbox.x0; c.cy = h - (c.cy - bbox.y0);
+        c.fx -= bbox.x0; c.fy = h - (c.fy - bbox.y0);
+      } else {
+        c.x1 -= bbox.x0; c.y1 = h - (c.y1 - bbox.y0);
+        c.x2 -= bbox.x0; c.y2 = h - (c.y2 - bbox.y0);
+      }
+    }
   });
   return shapes;
 }
@@ -2132,7 +2229,7 @@ function importEPSText(text) {
 
 /* ---------- Export ---------- */
 function shapeToSVGString(s) {
-  const fill = s.fill == null ? 'none' : s.fill;
+  const fill = s.gradient ? 'url(#' + gradientIdFor(s.id) + ')' : (s.fill == null ? 'none' : s.fill);
   const stroke = s.stroke == null ? 'none' : s.stroke;
   const common = 'fill="' + fill + '" stroke="' + stroke + '" stroke-width="' + (s.strokeWidth || 0) + '" opacity="' + (s.opacity == null ? 1 : s.opacity) + '"' + (s.visible === false ? ' display="none"' : '');
   if (s.type === 'rect') return '<rect x="' + s.x + '" y="' + s.y + '" width="' + s.w + '" height="' + s.h + '"' + (s.rx ? ' rx="' + s.rx + '"' : '') + ' ' + common + '/>';
@@ -2142,14 +2239,33 @@ function shapeToSVGString(s) {
   if (s.type === 'path') return '<path d="' + commandsToD(s.commands) + '"' + (s.fillRule === 'evenodd' ? ' fill-rule="evenodd"' : '') + ' ' + common + '/>';
   return '';
 }
+function gradientDefsToSVGString(shapes) {
+  let out = '';
+  for (const s of shapes) {
+    if (!s.gradient || !s.gradient.stops || !s.gradient.stops.length) continue;
+    const g = s.gradient;
+    const stopsMarkup = g.stops.map(function (stop) {
+      return '<stop offset="' + Math.max(0, Math.min(1, stop.offset)) + '" stop-color="' + stop.color + '"' + (stop.opacity != null && stop.opacity < 1 ? ' stop-opacity="' + stop.opacity + '"' : '') + '/>';
+    }).join('');
+    if (g.type === 'radial') {
+      out += '<radialGradient id="' + gradientIdFor(s.id) + '" gradientUnits="userSpaceOnUse" cx="' + g.coords.cx + '" cy="' + g.coords.cy + '" r="' + Math.max(0.01, g.coords.r) + '"' +
+        (g.coords.fx != null ? ' fx="' + g.coords.fx + '"' : '') + (g.coords.fy != null ? ' fy="' + g.coords.fy + '"' : '') + '>' + stopsMarkup + '</radialGradient>';
+    } else {
+      out += '<linearGradient id="' + gradientIdFor(s.id) + '" gradientUnits="userSpaceOnUse" x1="' + g.coords.x1 + '" y1="' + g.coords.y1 + '" x2="' + g.coords.x2 + '" y2="' + g.coords.y2 + '">' + stopsMarkup + '</linearGradient>';
+    }
+  }
+  return out;
+}
 function exportSVG() {
   if (!state.shapes.length) { toast('Nothing to export yet.'); return; }
   const box = unionBBox(state.shapes.map(shapeBBox));
   const pad = 20;
   const vb = { x: box.x - pad, y: box.y - pad, w: box.w + pad * 2, h: box.h + pad * 2 };
+  const defs = gradientDefsToSVGString(state.shapes);
   let body = state.shapes.map(shapeToSVGString).join('\n  ');
   const svg = '<?xml version="1.0" encoding="UTF-8"?>\n' +
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="' + vb.x + ' ' + vb.y + ' ' + vb.w + ' ' + vb.h + '" width="' + Math.round(vb.w) + '" height="' + Math.round(vb.h) + '">\n  ' +
+    (defs ? '<defs>' + defs + '</defs>\n  ' : '') +
     body + '\n</svg>\n';
   const blob = new Blob([svg], { type: 'image/svg+xml' });
   const url = URL.createObjectURL(blob);
