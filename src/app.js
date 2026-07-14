@@ -1617,9 +1617,20 @@ function wireToolbar() {
 }
 function setTool(tool) {
   if (state.draft) { state.draft = null; }
+  if (tool === 'node') {
+    const single = state.selectedIds.length === 1 ? shapeById(state.selectedIds[0]) : null;
+    if (single && single.type === 'path') {
+      state.nodeEditShapeId = single.id;
+    } else {
+      toast(state.selectedIds.length === 0
+        ? 'Select a path first, or double-click one directly, to edit its nodes.'
+        : 'Node editing only works on paths — the current selection isn\'t a path.');
+      return; // stay on the current tool rather than switching to one with nothing to do
+    }
+  } else {
+    state.nodeEditShapeId = null;
+  }
   state.tool = tool;
-  if (tool !== 'node') state.nodeEditShapeId = null;
-  else if (state.selectedIds.length === 1) { const s = shapeById(state.selectedIds[0]); if (s && s.type === 'path') state.nodeEditShapeId = s.id; }
   syncToolbarActive();
   render();
   El.statusText.textContent = statusHintFor(tool);
@@ -1764,6 +1775,7 @@ function unlockSvg() { return '<svg viewBox="0 0 24 24" width="13" height="13"><
 function trashSvg() { return '<svg viewBox="0 0 24 24" width="14" height="14"><path fill="currentColor" d="M6 7h12l-1 13H7L6 7zm3-3h6l1 2H8l1-2zM4 7h16"/><path stroke="currentColor" stroke-width="1.5" fill="none" d="M4 7h16"/></svg>'; }
 
 /* ---------- Properties panel ---------- */
+let gradEditStopIndex = 0;
 function field(label, inputHtml) { return '<label class="prop-field"><span>' + label + '</span>' + inputHtml + '</label>'; }
 function renderProps() {
   const sel = selectedShapes();
@@ -1786,11 +1798,15 @@ function renderProps() {
           return '<option value="' + f + '"' + (s.fontFamily === f ? ' selected' : '') + '>' + f.split(',')[0] + '</option>';
         }).join('') + '</select></label>';
     } else if (s.type === 'path') {
-      html += '<div class="hint-text">' + s.commands.length + ' path commands · press A to edit nodes' + (s.gradient ? ' · gradient fill (editing Fill below replaces it with a flat color)' : '') + '</div>';
+      html += '<div class="hint-text">' + s.commands.length + ' path commands · press A to edit nodes</div>';
     }
   }
   html += '<div class="props-section-title">' + (sel.length > 1 ? sel.length + ' OBJECTS · STYLE' : 'STYLE') + '</div>';
-  html += field('Fill', colorField('fill', s.fill));
+  if (sel.length === 1) {
+    html += fillSectionHtml(s);
+  } else {
+    html += field('Fill', colorField('fill', s.fill));
+  }
   html += field('Stroke', colorField('stroke', s.stroke));
   html += field('Stroke width', num('strokeWidth', s.strokeWidth || 0));
   html += field('Opacity', '<input type="range" min="0" max="1" step="0.05" data-key="opacity" value="' + (s.opacity == null ? 1 : s.opacity) + '">');
@@ -1819,6 +1835,178 @@ function renderProps() {
       render(); renderLayers(); pushHistory();
     });
   });
+
+  if (sel.length === 1) wireGradientEditor(s);
+}
+function wireGradientEditor(s) {
+  const fmodeBtns = El.propsBody.querySelectorAll('.fmode-btn[data-fmode]');
+  fmodeBtns.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      const mode = btn.getAttribute('data-fmode');
+      if (mode === 'gradient' && !s.gradient) {
+        const b = shapeBBox(s);
+        const baseColor = (s.fill && s.fill !== 'none') ? s.fill : '#5eead4';
+        s.gradient = {
+          type: 'linear',
+          stops: [{ offset: 0, color: baseColor }, { offset: 1, color: '#0d0f12' }],
+          coords: { x1: b.x, y1: b.y + b.h / 2, x2: b.x + b.w, y2: b.y + b.h / 2 },
+        };
+        gradEditStopIndex = 0;
+        pushHistory();
+      } else if (mode === 'solid' && s.gradient) {
+        s.fill = s.gradient.stops[0].color;
+        s.gradient = null;
+        pushHistory();
+      }
+      render(); renderLayers(); renderProps();
+    });
+  });
+  if (!s.gradient) return;
+
+  El.propsBody.querySelectorAll('.gtype-btn[data-gtype]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      const type = btn.getAttribute('data-gtype');
+      if (s.gradient.type === type) return;
+      const b = shapeBBox(s);
+      s.gradient.type = type;
+      if (type === 'radial') {
+        const cx = b.x + b.w / 2, cy = b.y + b.h / 2, r = Math.max(b.w, b.h) / 2 || 10;
+        s.gradient.coords = { cx: cx, cy: cy, r: r, fx: cx, fy: cy };
+      } else {
+        s.gradient.coords = { x1: b.x, y1: b.y + b.h / 2, x2: b.x + b.w, y2: b.y + b.h / 2 };
+      }
+      pushHistory();
+      render(); renderLayers(); renderProps();
+    });
+  });
+
+  const stopColorInput = El.propsBody.querySelector('#gradStopColor');
+  const stopOffsetInput = El.propsBody.querySelector('#gradStopOffset');
+  const bar = El.propsBody.querySelector('#gradBar');
+
+  if (stopColorInput) {
+    stopColorInput.addEventListener('input', function () {
+      s.gradient.stops[gradEditStopIndex].color = stopColorInput.value;
+      if (bar) updateGradBarBackground(bar, s.gradient.stops);
+      const handle = bar && bar.querySelector('.grad-handle[data-stop-idx="' + gradEditStopIndex + '"]');
+      if (handle) handle.style.background = stopColorInput.value;
+      render(); renderLayers();
+    });
+    stopColorInput.addEventListener('change', function () { pushHistory(); });
+  }
+  if (stopOffsetInput) {
+    const commitOffset = function () {
+      let v = parseFloat(stopOffsetInput.value);
+      if (isNaN(v)) v = 0;
+      v = Math.max(0, Math.min(100, v)) / 100;
+      s.gradient.stops[gradEditStopIndex].offset = v;
+      if (bar) updateGradBarBackground(bar, s.gradient.stops);
+      const handle = bar && bar.querySelector('.grad-handle[data-stop-idx="' + gradEditStopIndex + '"]');
+      if (handle) handle.style.left = (v * 100) + '%';
+      render(); renderLayers();
+    };
+    stopOffsetInput.addEventListener('input', commitOffset);
+    stopOffsetInput.addEventListener('change', function () { commitOffset(); pushHistory(); });
+  }
+  const removeBtn = El.propsBody.querySelector('#gradRemoveStop');
+  if (removeBtn) {
+    removeBtn.addEventListener('click', function () {
+      if (s.gradient.stops.length <= 2) return;
+      s.gradient.stops.splice(gradEditStopIndex, 1);
+      gradEditStopIndex = Math.max(0, gradEditStopIndex - 1);
+      pushHistory();
+      render(); renderLayers(); renderProps();
+    });
+  }
+  if (bar) {
+    bar.addEventListener('click', function (e) {
+      if (e.target.classList.contains('grad-handle')) return;
+      const rect = bar.getBoundingClientRect();
+      const offset = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const color = interpolateGradientColor(s.gradient.stops, offset);
+      s.gradient.stops.push({ offset: offset, color: color });
+      gradEditStopIndex = s.gradient.stops.length - 1;
+      pushHistory();
+      render(); renderLayers(); renderProps();
+    });
+    bar.querySelectorAll('.grad-handle').forEach(function (handle) {
+      handle.addEventListener('pointerdown', function (e) {
+        e.stopPropagation();
+        e.preventDefault();
+        const idx = parseInt(handle.getAttribute('data-stop-idx'), 10);
+        gradEditStopIndex = idx;
+        bar.querySelectorAll('.grad-handle').forEach(function (h) { h.classList.remove('selected'); });
+        handle.classList.add('selected');
+        if (stopColorInput) stopColorInput.value = s.gradient.stops[idx].color;
+        if (stopOffsetInput) stopOffsetInput.value = Math.round(s.gradient.stops[idx].offset * 100);
+        const rect = bar.getBoundingClientRect();
+        function onMove(ev) {
+          const offset = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+          s.gradient.stops[idx].offset = offset;
+          handle.style.left = (offset * 100) + '%';
+          updateGradBarBackground(bar, s.gradient.stops);
+          if (stopOffsetInput) stopOffsetInput.value = Math.round(offset * 100);
+          render();
+        }
+        function onUp() {
+          window.removeEventListener('pointermove', onMove);
+          window.removeEventListener('pointerup', onUp);
+          pushHistory();
+          renderLayers();
+        }
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp);
+      });
+    });
+  }
+}
+function fillSectionHtml(shape) {
+  const isGrad = !!shape.gradient;
+  let html = '<div class="prop-field full"><span>Fill</span><div class="fill-mode-toggle">' +
+    '<button type="button" class="fmode-btn' + (!isGrad ? ' active' : '') + '" data-fmode="solid">Solid</button>' +
+    '<button type="button" class="fmode-btn' + (isGrad ? ' active' : '') + '" data-fmode="gradient">Gradient</button>' +
+    '</div></div>';
+  if (isGrad) html += gradientEditorHtml(shape);
+  else html += '<label class="prop-field"><span></span>' + colorField('fill', shape.fill) + '</label>';
+  return html;
+}
+function gradientEditorHtml(shape) {
+  const g = shape.gradient;
+  if (gradEditStopIndex >= g.stops.length) gradEditStopIndex = 0;
+  const sorted = g.stops.map(function (st, i) { return { st: st, i: i }; }).sort(function (a, b) { return a.st.offset - b.st.offset; });
+  const cssStops = sorted.map(function (o) { return o.st.color + ' ' + (o.st.offset * 100) + '%'; }).join(', ');
+  const handles = g.stops.map(function (st, i) {
+    return '<div class="grad-handle' + (i === gradEditStopIndex ? ' selected' : '') + '" data-stop-idx="' + i + '" style="left:' + (st.offset * 100) + '%;background:' + st.color + '" title="Drag to reposition · click to select"></div>';
+  }).join('');
+  const selStop = g.stops[gradEditStopIndex];
+  return (
+    '<div class="prop-field full"><span></span><div class="grad-type-toggle">' +
+      '<button type="button" class="gtype-btn' + (g.type === 'linear' ? ' active' : '') + '" data-gtype="linear">Linear</button>' +
+      '<button type="button" class="gtype-btn' + (g.type === 'radial' ? ' active' : '') + '" data-gtype="radial">Radial</button>' +
+    '</div></div>' +
+    '<div class="prop-field full"><span></span><div class="gradient-bar" id="gradBar" style="background:linear-gradient(to right, ' + cssStops + ')">' + handles + '</div></div>' +
+    '<div class="prop-field"><span>Stop color</span><input type="color" id="gradStopColor" value="' + selStop.color + '"></div>' +
+    '<div class="prop-field"><span>Stop position</span><input type="number" id="gradStopOffset" min="0" max="100" value="' + Math.round(selStop.offset * 100) + '"></div>' +
+    '<button type="button" class="fmode-btn" id="gradRemoveStop"' + (g.stops.length <= 2 ? ' disabled' : '') + ' style="width:100%;margin-top:2px">Remove selected stop</button>'
+  );
+}
+function updateGradBarBackground(bar, stops) {
+  const sorted = stops.slice().sort(function (a, b) { return a.offset - b.offset; });
+  bar.style.background = 'linear-gradient(to right, ' + sorted.map(function (s) { return s.color + ' ' + (s.offset * 100) + '%'; }).join(', ') + ')';
+}
+function interpolateGradientColor(stops, offset) {
+  const sorted = stops.slice().sort(function (a, b) { return a.offset - b.offset; });
+  if (offset <= sorted[0].offset) return sorted[0].color;
+  if (offset >= sorted[sorted.length - 1].offset) return sorted[sorted.length - 1].color;
+  for (let i = 0; i < sorted.length - 1; i++) {
+    if (offset >= sorted[i].offset && offset <= sorted[i + 1].offset) {
+      const t = (offset - sorted[i].offset) / ((sorted[i + 1].offset - sorted[i].offset) || 1);
+      const c1 = colorToRgb(sorted[i].color), c2 = colorToRgb(sorted[i + 1].color);
+      if (!c1 || !c2) return sorted[i].color;
+      return rgbToHexStr(c1.r + (c2.r - c1.r) * t, c1.g + (c2.g - c1.g) * t, c1.b + (c2.b - c1.b) * t);
+    }
+  }
+  return sorted[0].color;
 }
 function num(key, val) { return '<input type="number" data-key="' + key + '" value="' + (isNaN(val) ? 0 : Math.round(val * 100) / 100) + '">'; }
 function colorField(key, val) {
