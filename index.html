@@ -1742,7 +1742,7 @@ function onCanvasPointerDown(e) {
         state.selectedIds = [targetId];
       }
       renderOverlay(); renderProps(); renderLayers();
-      pointerState = { type: 'move', start: p, orig: selectedShapes().map(function (s) { return JSON.parse(JSON.stringify(s)); }) };
+      pointerState = { type: 'move', start: p, moved: false, orig: selectedShapes().map(function (s) { return JSON.parse(JSON.stringify(s)); }) };
     } else {
       pointerState = { type: 'marquee', start: p, rect: { x: p.x, y: p.y, w: 0, h: 0 } };
     }
@@ -1810,6 +1810,11 @@ function onCanvasPointerMove(e) {
 
   if (pointerState.type === 'move') {
     const dx = p.x - pointerState.start.x, dy = p.y - pointerState.start.y;
+    if (!pointerState.moved) {
+      const threshold = (state.viewBox.w / (El.canvasWrap.clientWidth || 900)) * 4; // ~4 screen px in SVG units
+      if (Math.hypot(dx, dy) < threshold) return; // still just a click, not a drag yet — don't touch the DOM
+      pointerState.moved = true;
+    }
     pointerState.orig.forEach(function (origShape) {
       const clone = JSON.parse(JSON.stringify(origShape));
       moveShape(clone, dx, dy);
@@ -1903,9 +1908,11 @@ function onCanvasPointerUp(e) {
     }
     renderLayers();
   }
-  if (['move', 'resize', 'draw', 'nodeDrag'].includes(pointerState.type)) pushHistory();
+  const wasNoOpClick = pointerState.type === 'move' && !pointerState.moved;
+  if (['move', 'resize', 'draw', 'nodeDrag'].includes(pointerState.type) && !wasNoOpClick) pushHistory();
   pointerState = null;
-  render(); renderOverlay(); renderProps();
+  if (!wasNoOpClick) render();
+  renderOverlay(); renderProps();
 }
 
 function onCanvasDblClick(e) {
