@@ -82,6 +82,60 @@ function makePath(commands) {
   return baseShape('path', { commands: commands, fill: 'none', fillRule: 'nonzero' });
 }
 
+const BEZIER_KAPPA = 0.5522847498307936; // standard 4-curve circle/ellipse approximation constant
+function convertShapeToPath(shape) {
+  let cmds;
+  const k = BEZIER_KAPPA;
+  if (shape.type === 'rect') {
+    const x = shape.x, y = shape.y, w = shape.w, h = shape.h;
+    const r = Math.max(0, Math.min(shape.rx || 0, w / 2, h / 2));
+    if (r > 0.01) {
+      cmds = [
+        { type: 'M', x: x + r, y: y },
+        { type: 'L', x: x + w - r, y: y },
+        { type: 'C', x1: x + w - r + k * r, y1: y, x2: x + w, y2: y + r - k * r, x: x + w, y: y + r },
+        { type: 'L', x: x + w, y: y + h - r },
+        { type: 'C', x1: x + w, y1: y + h - r + k * r, x2: x + w - r + k * r, y2: y + h, x: x + w - r, y: y + h },
+        { type: 'L', x: x + r, y: y + h },
+        { type: 'C', x1: x + r - k * r, y1: y + h, x2: x, y2: y + h - r + k * r, x: x, y: y + h - r },
+        { type: 'L', x: x, y: y + r },
+        { type: 'C', x1: x, y1: y + r - k * r, x2: x + r - k * r, y2: y, x: x + r, y: y },
+        { type: 'Z' },
+      ];
+    } else {
+      cmds = [
+        { type: 'M', x: x, y: y }, { type: 'L', x: x + w, y: y },
+        { type: 'L', x: x + w, y: y + h }, { type: 'L', x: x, y: y + h }, { type: 'Z' },
+      ];
+    }
+  } else if (shape.type === 'ellipse') {
+    const cx = shape.cx, cy = shape.cy, rx = shape.rx, ry = shape.ry;
+    cmds = [
+      { type: 'M', x: cx + rx, y: cy },
+      { type: 'C', x1: cx + rx, y1: cy + ry * k, x2: cx + rx * k, y2: cy + ry, x: cx, y: cy + ry },
+      { type: 'C', x1: cx - rx * k, y1: cy + ry, x2: cx - rx, y2: cy + ry * k, x: cx - rx, y: cy },
+      { type: 'C', x1: cx - rx, y1: cy - ry * k, x2: cx - rx * k, y2: cy - ry, x: cx, y: cy - ry },
+      { type: 'C', x1: cx + rx * k, y1: cy - ry, x2: cx + rx, y2: cy - ry * k, x: cx + rx, y: cy },
+      { type: 'Z' },
+    ];
+  } else if (shape.type === 'line') {
+    cmds = [{ type: 'M', x: shape.x1, y: shape.y1 }, { type: 'L', x: shape.x2, y: shape.y2 }];
+  } else {
+    return null; // text (no font-to-path conversion available) or already a path
+  }
+  const newShape = makePath(cmds);
+  newShape.id = shape.id; // preserve identity: selection/layer position/history stay coherent
+  newShape.name = shape.name;
+  newShape.fill = shape.fill;
+  newShape.stroke = shape.stroke;
+  newShape.strokeWidth = shape.strokeWidth;
+  newShape.opacity = shape.opacity;
+  newShape.visible = shape.visible;
+  newShape.locked = shape.locked;
+  newShape.gradient = shape.gradient || null;
+  return newShape;
+}
+
 /* ---------- Path <-> d string ---------- */
 function commandsToD(cmds) {
   let d = '';
@@ -1572,6 +1626,19 @@ function onCanvasDblClick(e) {
     const s = shapeById(targetId);
     if (s && s.type === 'text') { openTextEditor(s); return; }
     if (s && s.type === 'path') { state.tool = 'node'; state.nodeEditShapeId = s.id; state.selectedIds = [s.id]; render(); syncToolbarActive(); return; }
+    if (s && (s.type === 'rect' || s.type === 'ellipse' || s.type === 'line')) {
+      const converted = convertShapeToPath(s);
+      if (converted) {
+        const idx = state.shapes.findIndex(function (x) { return x.id === s.id; });
+        if (idx !== -1) state.shapes[idx] = converted;
+        state.tool = 'node';
+        state.nodeEditShapeId = converted.id;
+        state.selectedIds = [converted.id];
+        pushHistory();
+        render(); renderLayers(); renderProps(); syncToolbarActive();
+      }
+      return;
+    }
   }
   if (state.tool === 'pen' && state.draft && state.draft.points.length >= 2) finalizePenDraft(false);
 }
@@ -1621,10 +1688,18 @@ function setTool(tool) {
     const single = state.selectedIds.length === 1 ? shapeById(state.selectedIds[0]) : null;
     if (single && single.type === 'path') {
       state.nodeEditShapeId = single.id;
+    } else if (single && (single.type === 'rect' || single.type === 'ellipse' || single.type === 'line')) {
+      const converted = convertShapeToPath(single);
+      const idx = state.shapes.findIndex(function (x) { return x.id === single.id; });
+      if (idx !== -1) state.shapes[idx] = converted;
+      state.nodeEditShapeId = converted.id;
+      state.selectedIds = [converted.id];
+      pushHistory();
+      renderLayers(); renderProps();
     } else {
       toast(state.selectedIds.length === 0
-        ? 'Select a path first, or double-click one directly, to edit its nodes.'
-        : 'Node editing only works on paths — the current selection isn\'t a path.');
+        ? 'Select a shape first, or double-click one directly, to edit its nodes.'
+        : 'Node editing doesn\'t support text — select a different shape.');
       return; // stay on the current tool rather than switching to one with nothing to do
     }
   } else {
